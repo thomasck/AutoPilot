@@ -1,0 +1,7 @@
+SET(DRIVE_SRCS
+    flight.cpp)
+
+ADD_EXECUTABLE(flight ${DRIVE_SRCS})
+TARGET_LINK_LIBRARIES(flight AutoPilot)
+
+INSTALL(TARGETS flight DESTINATION bin)
