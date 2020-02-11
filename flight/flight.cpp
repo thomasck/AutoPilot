@@ -1,19 +1,8 @@
 ////////////////////////////////////////////////////////////////////////////
-//
-//  This file was originally part of RTIMULib and has been modified
-//  for the purposes of Thomas Kirven and his masters thesis
-//
-//  Copyright (c) 2014-2015, richards-tech, LLC
-//
-//  Permission is hereby granted, free of charge, to any person obtaining a copy of
-//  this software and associated documentation files (the "Software"), to deal in
-//  the Software without restriction, including without limitation the rights to use,
-//  copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the
-//  Software, and to permit persons to whom the Software is furnished to do so,
-//  subject to the following conditions:
-//
-//  The above copyright notice and this permission notice shall be included in all
-//  copies or substantial portions of the Software.
+// This file contains guidance, navigation, and control code implementing the methods described in the thesis
+// "Autonomous Quadrotor Collision Avoidance and Destination Seeking in a GPS-Denied Environment" 
+// by Thomas Kirven
+////////////////////////////////////////////////////////////////////////////
 
 /** ---- Information ---- **/
 /*  - Most data structures and variables are defined in flight.h */
@@ -22,11 +11,12 @@
 
 #include "flight.h" // flight.h contains all other #inlcudes, data structure inits, and functions
 
-/** ---- Actuator and Control Configuration ---- **/
+/** ---- Actuator, Guidance, and Control Configuration ---- **/
 /*  - define PWM to idle props and fly */
 /*  - comment out PWM to disable propellers (sensors and control computations still run)*/
 /*  - define FLOW to enable optical flow and velocity control */
 /*  - comment out FLOW to track zero attitude and altitude command z_g */
+/*  - define REALSENSE to use obstacle avoidance */
 #define PWM
 #define FLOW
 #define REALSENSE
@@ -45,36 +35,35 @@
 #endif
 
 #ifdef REALSENSE
-#define AVOIDANCE
+#define AVOIDANCE // comment out to remove avoidance velocity, but still record positions of obstacles
 #endif
 
 /*  -- enable/disable Integral action -- */
 /*  - define VIC to use velocity integral control */
 /*  - define AIC to use Euler angle integral control */
 /*  - define RIC to use rate integral control */
-#define VIC
+//#define VIC
 //#define AIC
 //#define RIC
 
 /*  -- Adaptive adjustments -- */
 /*  Recommend use with zero velocity command and constant height command */
 /*  - define ADPT_K to adapt thrust constant k based on e_w  */
-/*  - degine ADPT_ATT to adapt reference attitude based on e_u and e_v */
+/*  - define ADPT_ATT to adapt reference quaternion based on e_u and e_v */
 //#define ADPT_K
 //#define ADPT_ATT
 
-
-float g2r=.012383; // raw gyro units to radians (multiplier 1000 deg/s)
-//float g2r=.024766; // raw gyro units to radians (multiplier 2000 deg/s)
+float g2r=.012383; // raw gyro units to radians (multiplier for 1000 deg/s)
+//float g2r=.024766; // raw gyro units to radians (multiplier for 2000 deg/s)
 float a2si=0.001133; // raw accel to m/s^2 (multiplier)
 
 int main() {
-  // Bash script which checks if this program (RTIMULibDrive.cpp) is running
-  // - if not, it execute 'kpwm' which shuts down the pwm driver
+  // Bash script which checks if this program (flight.cpp) is running
+  // - if not, it execute 'kpwm' which shuts down the motors
   printf("Starting safe_check...\n");
   system("./safe_check &");
 
-  // set up MPU
+  // set up MPU9150/9250 IMU
   MPU9150 mpu=MPU9150();
   mpu.initialize();
 
@@ -82,10 +71,10 @@ int main() {
 
   if (devStatus == 0) {
 
-    mpu.setDMPEnabled(true);
+    mpu.setDMPEnabled(true); // enable onboard motion processor
     mpuIntStatus = mpu.getIntStatus();
 
-    // set our DMP Ready flag so the main loop() function knows it's okay to use it
+    // set our DMP Ready flag so the main while loop knows it's okay to use it
     printf("DMP ready! Waiting for interrupt...");
     dmpReady = true;
 
@@ -101,6 +90,7 @@ int main() {
     printf("DMP Initialization failed (code %d ) \n",devStatus);
   }
 
+  // set up Realsense R200
 #ifdef REALSENSE
   rs::log_to_console(rs::log_severity::warn);
   //rs::log_to_file(rs::log_severity::debug, "librealsense.log");
@@ -115,33 +105,13 @@ int main() {
   try { dev.enable_stream(rs::stream::infrared2, rs::preset::best_quality); } catch(...) {}
   dev.start();
 
+  // preset 5 minimizes the number of false positives (depth data where there is no object)
   apply_depth_control_preset(&dev,5);
 
   const rs::intrinsics depth_intrin = dev.get_stream_intrinsics(rs::stream::depth);
 #endif
 
-  // Kalman filter initializations
-  // accel
-  ph_k.setZero(); Q_k.setZero(); P_k.setZero(); R_k.setZero(); C_k.setZero();
-  P_k(0,0)=.01; P_k(1,1)=.01; P_k(2,2)=.01; // initial covariance
-  K_k.setZero();
-  x_k.setZero();
-  x_k(0)=.01; x_k(1)=.01; x_k(2)=.01; // initial state
-
-  // velocity
-  x.setZero(); y.setZero();
-  A.setZero(); _Q.setZero();
-  A = matrix::eye<float,4>(); B.setZero();
-  C.setZero(); R.setZero(); _P.setZero();
-  S_I.setZero(); K.setZero();
-  _P(0,0) = .01; _P(1,1) = .01; _P(2,2) = .01; _P(3,3) = .01;
-  x(0)=.01; x(1)=.01; x(2)=.01; x(3)=.01;
-
-  // other velocity
-  Ak.setZero(); Ck.setZero(); Rk.setZero(); Pk.setZero();
-  Pk(0,0) = .02; Pk(1,1) = .02;
-
-  /* Initial conditions */
+  /* Initial values */
   px[0]=10; py[0]=10; pz[0]=0;dist[0]=10;
 
   x_e[0]=0; y_e[0]=0; z_e[0]=0;
@@ -168,7 +138,7 @@ int main() {
   psi_d=0; // desired yaw
 
   Time[0]=0; // initial time
-  sample_freq[0]=100;
+  sample_freq[0]=50;
 
   // reference model derivatives (previous value holders)
   ud_cp=0; vd_cp=0; wd_cp=0; psid_cp=0;
@@ -182,35 +152,49 @@ int main() {
   u2_c=0; v2_c=0; w2_c=0; psi2_c=0;
   u3_c=0; v3_c=0; w3_c=0; psi3_c=0;
 
+  // Kalman filter initializations
+  // acceleration
+  ph_k.setZero(); Q_k.setZero(); P_k.setZero(); R_k.setZero(); C_k.setZero();
+  P_k(0,0)=.01; P_k(1,1)=.01; P_k(2,2)=.01; // initial covariance
+  K_k.setZero();
+  x_k.setZero();
+  x_k(0)=.01; x_k(1)=.01; x_k(2)=.01; // initial state
 
-  // EKF init for acceleration
-  R_k(0,0)=1; R_k(1,1)=1; R_k(2,2)=1; // accel sensor noise diag(a_x,a_y,a_z)
+  R_k(0,0)=1; R_k(1,1)=1; R_k(2,2)=1; // accel sensor noise matrix
   C_k(0,0) = 1; C_k(1,1) = 1; C_k(2,2) = 1;
 
-  // process noise variances
+  // process noise variances (gyro std dev^2)
   float phdv=.01*.01;
   float thdv=.01*.01;
   float psdv=.01*.01;
 
-  // EKF init for velocity
+  // velocity
+  x.setZero(); y.setZero();
+  A.setZero(); _Q.setZero();
+  A = matrix::eye<float,4>(); B.setZero();
+  C.setZero(); R.setZero(); _P.setZero();
+  S_I.setZero(); K.setZero();
+  _P(0,0) = .01; _P(1,1) = .01; _P(2,2) = .01; _P(3,3) = .01;
+  x(0)=.01; x(1)=.01; x(2)=.01; x(3)=.01;
+
   C(0,0) = 1; C(1,1) = 1; C(2,3) = 1; // measurement matrix
   _Q(0,0)=0.00001; _Q(1,1)=0.00001; _Q(2,2)=.05; _Q(3,3)=.0005; // process noise matrix
 
   R(2,2) = .01;
-  // skew sym matrix for omega (zeros on diagonal)
+  
   Om.setZero();
   V_q.setZero();
   V_qI.setZero();
   V_qIp.setZero();
 
-  // set up console io
+  // set up keyboard io
   struct termios ctty;
 
   tcgetattr(fileno(stdout), &ctty);
   ctty.c_lflag &= ~(ICANON);
   tcsetattr(fileno(stdout), TCSANOW, &ctty);
 
-    // Set up flow module on i2c-1
+    // set up flow module on i2c-1
 #ifdef FLOW
   mraa::I2c* flow;
   flow = new mraa::I2c(0);
@@ -248,6 +232,7 @@ int main() {
   printf("c - Calibrate ESC's\n");
   printf("s - use saved EPROM calibration\n\n");
 
+  // calibration procedure
   while(!cal) {
     if ((kcom = getUserChar()) != 0) {
 
@@ -264,7 +249,7 @@ int main() {
 
       case 's':
 	cal=true;
-	min1=1425; min2=1425; min3=1550; min4=1540;
+	min1=1445; min2=1425; min3=1475; min4=1475;
 	printf(" - using EPROM saved throttle range \n");
         printf("min1=%d; min2=%d; min3=%d; min4=%d; \n",min1,min2,min3,min4);
 	printf(" - done \n");
@@ -350,37 +335,36 @@ int main() {
   }
 #endif
 
-  float rng=high-max(max(min1,min2),max(min3,min4));  // effective pwm range
+  float rng=high-max(max(min1,min2),max(min3,min4));  // effective throttle range
   //printf("range = %f \n",rng);
 
   // physical parameters
-  float m = 1.082; // mass of quadrotor 1.01024 w/2200mah lip  (.9217 w/1300 mah lipo)
-  m = 1.02;
-  //m = .9217;
+  float m = 1.085; // mass of quadrotor 1.085 kg w/2200mah lip0 and 1.01 kg w/1300 mah lipo
+  //m = 1.01;
   float g = 9.80665; // magnitude of acceleration due to gravity
   float ll = .1185; // moment arm
   float ls = .1185;
-  float k = 6.0*pow(10,-6); // (7.5-6.0)*E-6 8045 thrust constant (wi^.5)
-  //float k = 1.29*pow(10,-3); // .00122 - .0014 thrust constant (wi^1)
-  kP[0]=k; //initial k
+  float k = 7.2*pow(10,-6); // (7.5-6.0)*E-6 8045 thrust constant (wi^.5)
+  kP[0]=k; // initial k
   float b = 1.4*pow(10,-7); // (7.0-10.0*E-8) 8045  // propeller drag constant (wi^.5)
-  //float b = .000122;
-  bP[0]=b;
+  bP[0]=b; // initial b
 
   // principle inertias
   float Ixx=.00585; // .00585
-  float Iyy=.00545; // .0054
+  float Iyy=.00575; // .0054
   float Izz=.0072; // .01 .. .008
   float Ip=.00002; // .00002 propeller lengthwise inertia
-/*
+
+  // without realsense
+  /*
   Ixx=.00561; // .00533
   Iyy=.00551; // .0049
   Izz=.0066; // .00655
 */
   // velocity gains
-  float ku=2.0;
-  float kv=2.0;
-  float kw=2.0;
+  float ku=3.0;
+  float kv=3.0;
+  float kw=2.5;
   float kiw=1.0;
 
   // attitude gains
@@ -393,26 +377,26 @@ int main() {
   float kq=7.0;
   float kr=7.0;
 
-  // integral gains remain zero unless integral controls are defined
+  // integral gains are zero unless integral controls are defined
   float kiu=0; float kiv=0;
   float kiph=0; float kith=0; float kips=0;
   float kip=0; float kiq=0; float kir=0;
 
 #ifdef VIC // velocity integral control
-  kiu=1.0;
-  kiv=1.0;
+  kiu=0.8;
+  kiv=0.8;
 #endif
 
 #ifdef AIC // angle integral control
-  kiph=4.5;
-  kith=4.5;
-  kips=4.5;
+  kiph=3.5;
+  kith=1.5;
+  kips=1.5;
 #endif
 
 #ifdef RIC // rate integral control
-  kip=6.0;
-  kiq=6.0;
-  kir=6.0;
+  kip=7.0;
+  kiq=7.0;
+  kir=7.0;
 #endif
 
   // reference model parameters
@@ -430,14 +414,15 @@ int main() {
   float b1=27;
   float b2=9; // p=-6
 
-  float sd=.5; // set speed of quadcopter
-  st_d=1.0; // stopping distance in terms of speed
+  float sd=.8; // set speed of quadcopter
+  st_d=1.0; // stopping distance
 
-  // set goal position
+  // set destination p_g(0)
   float x_g=0;
-  float y_g=0;
+  float y_g=-.2;
   float z_g=-1.0;
 
+  // put destination in vector format
   P_g(0) = x_g;
   P_g(1) = y_g;
   P_g(2) = z_g;
@@ -445,8 +430,8 @@ int main() {
   p_gn = P_g.norm();
 
   // inner and outer ellipsoid semi-principles axes
-  float ai=ll*4.3; float bi=ll*3.15; float ci=ll*2.0;
-  float ao=1.8*ai; float bo=1.8*bi; float co=1.8*ci;
+  float ai=ll*4.5; float bi=ll*2.8; float ci=ll*2.0;
+  float ao=2.0*ai; float bo=2.0*bi; float co=2.0*ci;
 
   printf("outer ellipsoid semi principle axes: %f, %f, %f \n",ao,bo,co);
   printf("inner ellipsoid semi principle axes: %f, %f, %f \n",ai,bi,ci);
@@ -454,19 +439,19 @@ int main() {
   // Ellipsoid radii and potential
   float R_o,R_i,U_e;
 
-  float ep=1.1; // potential constant
+  float ep=1.25; // maximum potential
 
   float d_min=2; // closest approach to obstacle (meters)
   bool col=false; // collision boolean
-  int cnt = 0;
+  int cnt = 0; // counter for position inside outer ellipsoids 
 
-  pts.setAll(10);
+  pts.setAll(100); // initialize obstacle positions to > 100 meters
   P_o.setZero();
 
+  // initialize data as a precaution
   u_d[0]=0; v_d[0]=0; w_d[0]=0;
 
   t1[0]=0; t2[0]=0; t3[0]=0;
-  // initial thrust;
   T[0]=m*g;
 
   om1[0]=T[0]/(4.0*k);
@@ -485,6 +470,7 @@ int main() {
   auto now = std::chrono::high_resolution_clock::now();
   long long microseconds = std::chrono::duration_cast<std::chrono::microseconds>(now-prev).count();
 
+  // rest orientation
   float phi_r=0; float theta_r=0; float psi_r=0;
   float arx=0; float ary=0; float arz=0;
   // let dmp settle and get reference orientaion (refQ)
@@ -536,6 +522,7 @@ int main() {
       }
     }
   }
+  // get static accel and reference orientation
   arx=arx/acnt;
   ary=ary/acnt;
   arz=arz/acnt;
@@ -546,20 +533,17 @@ int main() {
   ypr_r[0]=psi_r;
   ypr_r[1]=theta_r;
   ypr_r[2]=phi_r;
-
+  
   printf("IMU orientation on ground : \n roll = %f pitch = %f yaw = %f \n",
 	 ypr_r[2],-ypr_r[1],-ypr_r[0]);
-  // hard code reference orientation (roll&pitch) -0.060702 pitch = -0.013980
-  ypr_r[1]=0.03; // pitch (switch sign) roll = -0.082126 pitch = -0.013426
-  ypr_r[2]=-.064;  // roll
+  
+  // hard code reference quaternion (orientation)
+  ypr_r[1]=0.01; // pitch = -0.013426 (switch sign)
+  ypr_r[2]=-.08;  // roll = -0.082126 
   refQ=fromEuler(ypr_r);
   refQ.normalize();
 
-  // accelerometer offset from center of mass
-  //float rx=.012;
-  //float rz=-.025;
-
-  // Idle propellers at 1/30th full throttle
+  // Idle propellers at 1/15th full throttle
 #ifdef IDLE
   pwm->ledOffTime(0,min1+rng/15);
   pwm->ledOffTime(1,min2+rng/15);
@@ -567,6 +551,7 @@ int main() {
   pwm->ledOffTime(15,min4+rng/15);
 #endif
 
+  // check DMP settings
   uint8_t rate=mpu.getRate();
   printf("sample rate set to %d hz\n",1000/(1+rate));
   uint8_t fsync=mpu.getExternalFrameSync();
@@ -596,33 +581,10 @@ int main() {
       break;
     }
   }
-  prev = std::chrono::high_resolution_clock::now();
+  prev = std::chrono::high_resolution_clock::now(); // start time
 
   while (1) {
-    /*
-    if (!dmpReady) {
-#ifdef PWM
-      setAllPWM(pwm,low);
-#endif
 
-#ifdef FLOW
-      delete flow;
-#endif
-      // write data to .txt files
-      write_Freq(n,Time,sample_freq);
-      write_Position(n,x_e,y_e,z_e);
-      write_Velocity(n,Time,u_e,v_e,w_e,u_c,v_c,w_c);
-      write_Acceleration(n,Time,ud,vd,wd);
-      write_Angles(n,Time,phi,theta,psi,phi_d,theta_d,psi_c);
-      write_Angle_Errors(n,Time,e_phi,e_the,e_psi);
-      write_Rates(n,Time,p,q,r,p_d,q_d,r_d);
-      write_Rate_Errors(n,Time,e_p,e_q,e_r);
-      write_Inputs(n,Time,T,t1,t2,t3,om1,om2,om3,om4);
-
-      exit(1);
-      break;
-    }
-    */
     // reset interrupt flag and get INT_STATUS byte (resets after read)
     mpuInterrupt = false;
     mpuIntStatus = mpu.getIntStatus();
@@ -651,12 +613,12 @@ int main() {
 
       now = std::chrono::high_resolution_clock::now();
       microseconds = std::chrono::duration_cast<std::chrono::microseconds>(now-prev).count();
-      dt=(float)(microseconds)/1000000.0;
+      dt=(float)(microseconds)/1000000.0; // loop time (s)
       prev = now;
       Time[n+1] = Time[n]+dt;
       sample_freq[n+1]=1.0/dt;
 
-      // corrected quaternion
+      // quaternion with respect to reference quaternion
       corrQ = (refQ.getConjugate()).getProduct(Q);
       corrQ.normalize();
 
@@ -666,23 +628,24 @@ int main() {
 	theta[n+1] = ypr[1];
 	psi[n+1] = ypr[0];
       */
-      // Euler angles
+      
+      // convert quaternion to Euler angles
       mpu.dmpGetEuler(ypr, &corrQ);
       phi[n+1] = ypr[2];
       theta[n+1] = -ypr[1];
       psi[n+1] = -ypr[0];
 
-      // define current trig values. save space.
+      // define current trig functions of Euler angles to save space later on
       cph = cos(phi[n+1]); sph = sin(phi[n+1]); tph = tan(phi[n+1]);
       cth = cos(theta[n+1]); sth = sin(theta[n+1]); tth = tan(theta[n+1]);
       cps = cos(psi[n+1]); sps = sin(psi[n+1]);
 
-      // angular velocity
+      // angular velocity (seem to have constant bias which are subtracted below)
       p[n+1] = gyro[0]*g2r+.034;
       q[n+1] = -gyro[1]*g2r-.0185;
       r[n+1] = -gyro[2]*g2r-.0062;
 
-      // kinematics
+      // Euler rate kinematics
       phid = p[n+1]+q[n+1]*sph*tth+r[n+1]*cph*tth;
       thetad = q[n+1]*cph-r[n+1]*sph;
       psid = q[n+1]*sph/cth+r[n+1]*cph/cth;
@@ -690,30 +653,7 @@ int main() {
       // angular momentum
       //Hx[n+1]=Ixx*p[n+1]; Hy[n+1]=Iyy*q[n+1]; Hz[n+1]=Izz*r[n+1];
 
-#ifdef REALSENSE
-      if(dev.is_streaming()) dev.wait_for_frames();
-      auto points = reinterpret_cast<const rs::float3 *>(dev.get_frame_data(rs::stream::points));
-      //auto depth = reinterpret_cast<const uint16_t *>(dev.get_frame_data(rs::stream::depth));
-      min_dist = 30;
-      for(int yy=0; yy<depth_intrin.height; ++yy) {
-	for(int xx=0; xx<depth_intrin.width; ++xx) {
-	  if (points->z){
-	    dist[n+1] = points->x*points->x+points->y*points->y+points->z*points->z;
-	    if (dist[n+1]<min_dist) {
-	      min_dist = dist[n+1];
-	      px[n+1] = points->x;
-	      py[n+1] = points->y;
-	      pz[n+1] = points->z;
-	    }
-	  }
-	  ++points;
-	}
-      }
-
-      dist[n+1] = sqrt(min_dist);
-#endif
-
-      // if roll or pitch is dangerously large, kill pwm and write data
+      // if roll or pitch is too large, shut off propellers and write data
       if ((abs(phi[n+1])>1.3)||(abs(theta[n+1])>1.3)) {
 
 #ifdef PWM
@@ -748,6 +688,31 @@ int main() {
 	exit(1);
       }
 
+#ifdef REALSENSE
+      // get closest obstacle point (px,py,pz) from current frame 
+      if(dev.is_streaming()) dev.wait_for_frames();
+      auto points = reinterpret_cast<const rs::float3 *>(dev.get_frame_data(rs::stream::points));
+      //auto depth = reinterpret_cast<const uint16_t *>(dev.get_frame_data(rs::stream::depth));
+      min_dist = 30;
+      for(int yy=0; yy<depth_intrin.height; ++yy) {
+	for(int xx=0; xx<depth_intrin.width; ++xx) {
+	  if (points->z){
+	    dist[n+1] = points->x*points->x+points->y*points->y+points->z*points->z;
+	    if (dist[n+1]<min_dist) {
+	      min_dist = dist[n+1];
+	      px[n+1] = points->x;
+	      py[n+1] = points->y;
+	      pz[n+1] = points->z;
+	    }
+	  }
+	  ++points;
+	}
+      }
+
+      dist[n+1] = sqrt(min_dist); // distance to (px,py,pz)
+#endif
+      
+      // get linear acceleration
       mpu.dmpGetAccel(&aa,fifoBuffer);
       mpu.dmpGetGravity(&gravity, &corrQ);
       mpu.dmpGetLinearAccel(&aaReal, &aa, &gravity);
@@ -756,19 +721,19 @@ int main() {
       aaReal.z=aaReal.z;
       mpu.dmpGetLinearAccelInWorld(&aaWorld, &aaReal, &corrQ);
 
-      // inertial acceleration
+      // convert acceleration to correct units
       ud[n+1] = (aaWorld.x)*a2si;
       vd[n+1] = -(aaWorld.y)*a2si;
       wd[n+1] = -(aaWorld.z)*a2si;
 
+/** EKF for estimating acceleration **/
+      
+      // measurements for EKF
       y_k(0)=ud[n+1];
       y_k(1)=vd[n+1];
       y_k(2)=wd[n+1];
-
-      // here, O is roll-pitch-yaw consecutive rotation (body to inertial)
-      O = matrix::Eulerf(phi[n+1],theta[n+1],psi[n+1]);
-
-      // extended kalman filter for acceleration estimates
+      
+      // discrete transition matrix
       ph_k(0,0) = 1+alwd*dt/alw;
       ph_k(0,1) = -psid*dt;
       ph_k(0,2) = -kw*x_k(0)*dt/alw;
@@ -779,6 +744,7 @@ int main() {
 
       ph_k(2,2) = 1-kw*dt;
 
+      // discrete noise transition matrix
       Q_k(0,0) = (psid*(psid*(phdv*alw*alw*cps*cps+thdv*alw*alw*sps*sps+psdv*x_k(0)*x_k(0))+(alwd*(psdv*x_k(0)*x_k(1)+alw*alw*cps*phdv*sps-alw*alw*cps*sps*thdv))/alw)+(alwd*(psid*(psdv*x_k(0)*x_k(1) + alw*alw*cps*phdv*sps - alw*alw*cps*sps*thdv)+(alwd*(thdv*alw*alw*cps*cps+phdv*alw*alw*sps*sps+psdv*x_k(1)*x_k(1)))/alw))/alw)*dt*dt*dt/3+(2*psid*(psdv*x_k(0)*x_k(1)+alw*alw*cps*phdv*sps-alw*alw*cps*sps*thdv)+(2*alwd*(thdv*alw*alw*cps*cps+phdv*alw*alw*sps*sps+psdv*x_k(1)*x_k(1)))/alw)*dt*dt/2 + (thdv*alw*alw*cps*cps+phdv*alw*alw*sps*sps+psdv*x_k(1)*x_k(1))*dt;
 
       Q_k(0,1) = (psid*(psid*(psdv*x_k(0)*x_k(1)+alw*alw*cps*phdv*sps-alw*alw*cps*sps*thdv)+(alwd*(thdv*alw*alw*cps*cps+phdv*alw*alw*sps*sps+psdv*x_k(1)*x_k(1)))/alw)-(alwd*(psid*(phdv*alw*alw*cps*cps + thdv*alw*alw*sps*sps + psdv*x_k(0)*x_k(0))+(alwd*(psdv*x_k(0)*x_k(1)+alw*alw*cps*phdv*sps-alw*alw*cps*sps*thdv))/alw))/alw)*dt*dt*dt/3+(psid*(thdv*alw*alw*cps*cps+phdv*alw*alw*sps*sps+psdv*x_k(1)*x_k(1))-psid*(phdv*alw*alw*cps*cps+thdv*alw*alw*sps*sps+psdv*x_k(0)*x_k(0))-(2*alwd*(psdv*x_k(0)*x_k(1)+alw*alw*cps*phdv*sps-alw*alw*cps*sps*thdv))/alw)*dt*dt/2+(alw*alw*cps*sps*thdv-alw*alw*cps*phdv*sps-psdv*x_k(0)*x_k(1))*dt;
@@ -787,28 +753,27 @@ int main() {
 
       Q_k(1,1) = (psid*(psid*(thdv*alw*alw*cps*cps+phdv*alw*alw*sps*sps+psdv*x_k(1)*x_k(1))-(alwd*(psdv*x_k(0)*x_k(1)+alw*alw*cps*phdv*sps-alw*alw*cps*sps*thdv))/alw)-(alwd*(psid*(psdv*x_k(0)*x_k(1) + alw*alw*cps*phdv*sps - alw*alw*cps*sps*thdv)-(alwd*(phdv*alw*alw*cps*cps+thdv*alw*alw*sps*sps+psdv*x_k(0)*x_k(0)))/alw))/alw)*dt*dt*dt/3+((2*alwd*(phdv*alw*alw*cps*cps+thdv*alw*alw*sps*sps+psdv*x_k(0)*x_k(0)))/alw-2*psid*(psdv*x_k(0)*x_k(1)+alw*alw*cps*phdv*sps-alw*alw*cps*sps*thdv))*dt*dt/2+(phdv*alw*alw*cps*cps+thdv*alw*alw*sps*sps+psdv*x_k(0)*x_k(0))*dt;
 
+      // compute Kalman gain
       P_k = ph_k*P_k*ph_k.transpose()+Q_k;
       SI_k = matrix::inv<float, 3>(C_k*P_k*C_k.transpose()+R_k);
-      K_k = P_k*C_k.transpose()*SI_k;
+      K_k = P_k*C_k.transpose()*SI_k; // Kalman gain
 
-      // predict .. x-k = x(k-1) + xd(k-1)*dt
+      // predict state
       x_k(0) = x_k(0) + (alwd*x_k(0)/alw-psid*x_k(1)+alw*(thetad*cps+phid*sps))*dt;
       x_k(1) = x_k(1) + (alwd*x_k(1)/alw+psid*x_k(0)+alw*(thetad*sps-phid*cps))*dt;
       x_k(2) = x_k(2) + alwd*dt;
 
-      // correct
-      x_k += K_k*(y_k-x_k);
+      x_k += K_k*(y_k-x_k); // correct state
+      P_k -= K_k*C_k*P_k; // update covariance
 
-      // update covariance
-      P_k -= K_k*C_k*P_k;
+      // filter output
+      ud[n+1]=x_k(0); // u dot 
+      vd[n+1]=x_k(1); // v dot 
+      wd[n+1]=x_k(2); // w dot 
 
-      // accelerations in inertial frame
-      ud[n+1]=x_k(0);
-      vd[n+1]=x_k(1);
-      wd[n+1]=x_k(2);
-
-      // update model
-      A(3,2) = dt;
+/** Kalman filter for estimating velocity **/
+          
+      A(3,2) = dt; // discrete transition matrix (diagonal entries are always 1)
 
       // input matrix
       B(0,0)=dt;
@@ -822,206 +787,205 @@ int main() {
       flow->readBytesReg(0x16,int_frame,26);
 #endif
 
+      // sonar measurement of height
       z_e[n+1]=-(int16_t)(frame[20] | frame[21] << 8)/(1.0e3f);
-      if (abs(z_e[n+1]-z_e[n])>.3) z_e[n+1]=z_e[n]+w_e[n]*dt;
-      //if (abs(z_e[n+1]-z_e[n])>.3) z_e[n+1]=z_e[n+1]-;
-      h=-z_e[n+1];
 
-/*      qual = (uint8_t)(int_frame[24]);
-      if (qual < 50 && !land) {
+      // if there's an instant change in z (there probably is an object below), then estimate correct height
+      if (abs(z_e[n+1]-z_e[n])>.28) z_e[n+1]=z_e[n]+w_e[n]*dt;
 
-        u_e[n+1]=x(0);//+ud[n+1]*dt; // u estimate
-        v_e[n+1]=x(1);//+vd[n+1]*dt; // v estimate
-        w_e[n+1]=x(2);//+wd[n+1]*dt; // w estimate
-        z_e[n+1]=x(3);//+w_e[n+1]*dt; // z estimate (height)
+      h=-z_e[n+1]; // height
 
-        x_e[n+1] = x_e[n]+V_qI(0)*dt;
-        y_e[n+1] = y_e[n]+V_qI(1)*dt;
+      // total measured optical flow
+      flow_x_rad = (int16_t)(int_frame[2] | int_frame[3] << 8)*1.24f/1.0e4f;
+      flow_y_rad = (int16_t)(int_frame[4] | int_frame[5] << 8)*1.24f/1.0e4f;
 
-        if (z_e[n+1]>-.3) z_e[n+1]=-.3;
-      } else {
-*/
-	dt_flow = (uint32_t)(int_frame[12] | int_frame[13] << 8 | int_frame[14] << 16 | int_frame[15] << 24)/1.0e6f;
+      // angular rotation since previous optical flow read
+      gyro_x_rad = (int16_t)(int_frame[6] | int_frame[7] << 8)*1.24f/1.0e4f;
+      gyro_y_rad = (int16_t)(int_frame[8] | int_frame[9] << 8)*1.24f/1.0e4f;
 
-        if (dt_flow > 0.5f || dt_flow < 1.0e-2f) {
-	  dt_flow = dt;
-        }
+      // time since previous optical flow read
+      dt_flow = (uint32_t)(int_frame[12] | int_frame[13] << 8 | int_frame[14] << 16 | int_frame[15] << 24)/1.0e6f;
 
-        flow_x_rad = (int16_t)(int_frame[2] | int_frame[3] << 8)*1.3f/1.0e4f;
-        flow_y_rad = (int16_t)(int_frame[4] | int_frame[5] << 8)*1.3f/1.0e4f;
+      // if dt_flow is unreasonable use loop time
+      if (dt_flow > 0.5f || dt_flow < 1.0e-2f) {
+	dt_flow = dt; 
+      }
+      
+      // translational velocity measurements
+      y(0) = (flow_y_rad - gyro_y_rad)*h/dt_flow;
+      y(1) = -(flow_x_rad - gyro_x_rad)*h/dt_flow;
+    
+      // roll-pitch-yaw consecutive rotation (body to inertial)
+      O = matrix::Eulerf(phi[n+1],theta[n+1],psi[n+1]);
+      // estimate b3 direction velocity
+      y(2)=(u_e[n]+ud[n]*dt)*O(0,2)+(v_e[n]+vd[n]*dt)*O(1,2)+(w_e[n]+wd[n]*dt)*O(2,2);
+      
+      V_q=y; // save quad velocity in body frame   
+      V_qI = O * V_q; // inertial quad velocity         
+      v=sqrt(y(0)*y(0)+y(1)*y(1)); // speed
+      
+      y = V_qI; // measurements for Kalman filter
+      
+      y(2)=z_e[n+1]; // height (with correct sign)
+      
+      // limits on height and speed for stddev calculation
+      if (h > h_max) h = h_max;
+      if (h < h_min) h = h_min;
+      if (v > v_max) v = v_max;
+      if (v < v_min) v = v_min;
+      
+      // optical flow standard dev. estimate
+      flow_vxy_stddev = P[0] * h + P[1] * h * h + P[2] * v + P[3] * v * h + P[4] * v * h * h;
 
-        gyro_x_rad = (int16_t)(int_frame[6] | int_frame[7] << 8)*1.3f/1.0e4f;
-        gyro_y_rad = (int16_t)(int_frame[8] | int_frame[9] << 8)*1.3f/1.0e4f;
+      // euler rate and body rate magnitudes squared
+      rot_sq = phi[n+1]*phi[n+1]+theta[n+1]*theta[n+1];
+      rotrate_sq = p[n+1]*p[n+1]+q[n+1]*q[n+1]+r[n+1]*r[n+1];
 
-        y(0) = -(flow_y_rad - gyro_y_rad)*z_e[n+1]/dt_flow;
-        y(1) = (flow_x_rad - gyro_x_rad)*z_e[n+1]/dt_flow;
+      // sensor noise matrix
+      R(0,0) = flow_vxy_stddev * flow_vxy_stddev;//+7.0f*(rot_sq+rotrate_sq);
+      R(1,1) = R(0,0);
 
-	// get rate compensated velocity in bodyframe
-//	y(0)=(int16_t)(frame[6] | frame[7] << 8)/6.95e2f;
-//        y(1)=(int16_t)(frame[8] | frame[9] << 8)/6.95e2f;
+      // compute Kalman gain
+      _P = A*_P*A.transpose() + _Q;
+      S_I = matrix::inv<float, 3>(C * _P * C.transpose() + R);
+      K = _P * C.transpose() * S_I; // Kalman gain
+         
+      x = A * x + B * x_k; // predict state
+      x += K * (y - C * x); // correct state
+      _P -= K * C * _P; // update covariance
+      
+      // filter output
+      u_e[n+1]=x(0); // u
+      v_e[n+1]=x(1); // v 
+      w_e[n+1]=x(2); // w 
+      
+      x_e[n+1] = x_e[n]+(V_qI(0)+V_qIp(0))*dt/2;
+      y_e[n+1] = y_e[n]+(V_qI(1)+V_qIp(1))*dt/2;
+      z_e[n+1]=x(3); // z (height)
+      
+      if (z_e[n+1]>-.3) z_e[n+1]=-.3; // if height estimate is bad, set z=.3 meters
 
-	// estimate b3 direction velocity
-        y(2)=(u_e[n]+ud[n]*dt)*O(0,2)+(v_e[n]+vd[n]*dt)*O(1,2)+(w_e[n]+wd[n]*dt)*O(2,2);
-
-        V_q=y; // save quad velocity in body frame
-
-        V_qI = O * V_q; // inertial quad velocity
-
-//	u_e[n+1] = V_qI(0);
-//      v_e[n+1] = V_qI(1);
-
-        v=sqrt(y(0)*y(0)+y(1)*y(1)); // speed
-
-        y = V_qI;
-
-        y(2)=z_e[n+1];
-
-        // limits on height and speed for stddev calculation
-        if (h > h_max) h = h_max;
-        if (h < h_min) h = h_min;
-        if (v > v_max) v = v_max;
-        if (v < v_min) v = v_min;
-
-        // optical flow error estimate
-        flow_vxy_stddev = P[0] * h + P[1] * h * h + P[2] * v + P[3] * v * h + P[4] * v * h * h;
-
-	rot_sq = phi[n+1]*phi[n+1]+theta[n+1]*theta[n+1];
-	rotrate_sq = p[n+1]*p[n+1]+q[n+1]*q[n+1]+r[n+1]*r[n+1];
-
-        R(0,0) = flow_vxy_stddev * flow_vxy_stddev;//+20.0f*(rot_sq+rotrate_sq);
-        R(1,1) = R(0,0);
-
-        // predict states
-        x = A * x + B * x_k;
-        // calculate residual (measured-predicted)
-        _P = A*_P*A.transpose() + _Q;
-        // residual covariance, (inverse)
-        S_I = matrix::inv<float, 3>(C * _P * C.transpose() + R);
-        K = _P * C.transpose() * S_I; // Kalman gain
-        _P -= K * C * _P;
-        // correct states
-        x += K * (y - C * x);
-
-        // filter output
-        u_e[n+1]=x(0); // u estimate
-        v_e[n+1]=x(1); // v estimate
-        w_e[n+1]=x(2); // w estimate
-
-        x_e[n+1] = x_e[n]+(V_qI(0)+V_qIp(0))*dt/2;
-        y_e[n+1] = y_e[n]+(V_qI(1)+V_qIp(1))*dt/2;
-	z_e[n+1]=x(3); // z estimate (height)
-
-        if (z_e[n+1]>-.3) z_e[n+1]=-.3;
-  //    }
 #ifdef DEST_SEEK
-      // omega skew sym. matrix
+      // estimate destination using rotating reference frame technique
       /*
-      Om(0,1) = -r[n+1];
-      Om(0,2) = q[n+1];
-      Om(1,0) = r[n+1];
-      Om(1,2) = -p[n+1];
-      Om(2,0) = -q[n+1];
-      Om(2,1) = p[n+1];
+	Om(0,1) = -r[n+1];
+	Om(0,2) = q[n+1];
+	Om(1,0) = r[n+1];
+	Om(1,2) = -p[n+1];
+	Om(2,0) = -q[n+1];
+	Om(2,1) = p[n+1];
+	
+	// enhance estimate of P_g using measured height
+	P_gI = O * P_g; // body to inertial
+	P_gI(2) = z_e[n+1] - z_g; // hard code height error since we have height measurement
+	P_g = O.transpose() * P_gI; // put back into body frame
+	
+	// propogate P_g
+	V_g = - V_q - Om*P_g;
+	P_g = P_g + V_g*dt;
+	
+	// rotate new P_g into inertial frame for control
+	P_gI = O * P_g;*/
 
-      // enhance estimate of P_g using measured height
-      P_gI = O * P_g; // body to inertial
-      P_gI(2) = z_e[n+1] - z_g; // hard code height error since we have height measure
-      P_g = O.transpose() * P_gI; // put back into body frame
-
-      // propogate P_g
-      V_g = - V_q - Om*P_g;
-      P_g = P_g + V_g*dt;
-
-      // rotate new P_g into inertial frame for control
-      P_gI = O * P_g;*/
-      P_gI(2) = z_e[n+1] - z_g; // might as well hard code this measurement again
+      // destination vector relative to quadrotor
+      P_gI(2) = z_e[n+1] - z_g; 
       P_gI(0) = x_e[n+1] - x_g;
       P_gI(1) = y_e[n+1] - y_g;
-
-      p_gn=P_gI.norm(); // distance to goal
-
+      
+      p_gn=P_gI.norm(); // distance to destination
+      
       if (p_gn<.002||land) { // go straight down
 	//land = true;
 	sd=.8;
 	P_gI(2)=-1;
       }
-
+      
       // compute destination seeking velocity
-      if (p_gn >= st_d) {
+      if (p_gn >= st_d) { // is distance to destination >= stopping distance
 	u_d[n+1]=-sd*P_gI(0)/p_gn;
 	v_d[n+1]=-sd*P_gI(1)/p_gn;
 	w_d[n+1]=-sd*P_gI(2)/p_gn;
-      } else {
+      } else { // distance to destination < stopping distance
 	u_d[n+1]=-sd*P_gI(0)/st_d;
 	v_d[n+1]=-sd*P_gI(1)/st_d;
 	w_d[n+1]=-sd*P_gI(2)/st_d;
       }
+
 #ifdef AVOIDANCE
       if (!land && avoid) {
 
-	cnt=0;
-	u_a = 0;
+	cnt=0; // reset counter for number of points in outer ellipsoid E_o
+	
+	// reset avoidance velocities
+	u_a = 0; 
 	v_a = 0;
 	w_a = 0;
 
-	// update relative position of points
+	// update position of detected points relative to quadrotor 
 	for (int j=0; j<n_pts; j++) {
 	  pts(0,j) = pts(0,j)-(V_qI(0)+V_qIp(0))*dt/2;
 	  pts(1,j) = pts(1,j)-(V_qI(1)+V_qIp(1))*dt/2;
 	  pts(2,j) = pts(2,j)-(V_qI(2)+V_qIp(2))*dt/2;
 
+	  // set jth colum of pts matrix as current position vector
 	  P_oI(0) = pts(0,j);
 	  P_oI(1) = pts(1,j);
 	  P_oI(2) = pts(2,j);
 
+	  // position in the body frame
 	  P_o = O.transpose() * P_oI;
 
+	  //  is P_o inside E_o
 	  if (in_Elpsd(P_o,ao,bo,co)) {
-	    cnt++;
-	    // get outer and inner ellipsoid radii
+	    cnt++; // add to counter
+	    // get outer and inner ellipsoid radii along P_o
 	    R_o = ElpsdRad(P_o,ao,bo,co);
 	    R_i = ElpsdRad(P_o,ai,bi,ci);
 
-	    U_e = ep*(1-(P_o.norm() - R_i)/(R_o - R_i));
+	    U_e = ep*(1-(P_o.norm() - R_i)/(R_o - R_i)); // compute potential of P_o
 	    //printf("U_e = %f\n",U_e);
 
-	    // add avoidance velocities
+	    // sum avoidance velocities from all points
 	    u_a=u_a + U_e * P_oI(0)/P_oI.norm();
 	    v_a=v_a + U_e * P_oI(1)/P_oI.norm();
 	    w_a=w_a + U_e * P_oI(2)/P_oI.norm();
 	  }
 	}
+	// nearest position from most recent realsense frame
 	P_o(0) = pz[n+1];
 	P_o(1) = px[n+1];
 	P_o(2) = py[n+1];
 
-        if (!(P_o(0)==0||P_o(1)==0||P_o(2)==0)) {
+        if (!(P_o(0)==0||P_o(1)==0||P_o(2)==0)) { // is position data good?
 
-	  P_oI = O * P_o;
+	  P_oI = O * P_o; // rotate to inertial frame
 
+	  // add to set of points (map)
 	  pts(0,i) = P_oI(0);
 	  pts(1,i) = P_oI(1);
 	  pts(2,i) = P_oI(2);
 
-	  if (++i == n_pts) i=0;
+	  if (++i == n_pts) i=0; // if number of points in map exceeds n_pts, then replace starting with oldest points
 
+	  // is most recent P_o in E_o
 	  if (in_Elpsd(P_o,ao,bo,co)) {
 	    cnt++;
-	    // get outer and inner ellipsoid radii
+	    // get outer and inner ellipsoid radii along P_o
 	    R_o = ElpsdRad(P_o,ao,bo,co);
 	    R_i = ElpsdRad(P_o,ai,bi,ci);
 
-	    U_e = ep*(1-(P_o.norm() - R_i)/(R_o - R_i));
+	    U_e = ep*(1-(P_o.norm() - R_i)/(R_o - R_i)); // compute potential of P_o
 	    //printf("U_e = %f\n",U_e);
 
-	    // add avoidance velocities
+	    // add to avoidance velocities
 	    u_a=u_a + U_e * P_oI(0)/P_oI.norm();
 	    v_a=v_a + U_e * P_oI(1)/P_oI.norm();
 	    w_a=w_a + U_e * P_oI(2)/P_oI.norm();
 	  }
         }
 
-	if (cnt>25) {
+	// sometimes false positives show up, so make sure at least 12 points are in E_o before adding to desired velocity
+	if (cnt>12) {
 	  float n_a = sqrt(u_a/cnt*u_a/cnt+v_a/cnt*v_a/cnt);
 	  if (n_a>1.5) {
              u_a=u_a/n_a;
@@ -1036,23 +1000,22 @@ int main() {
 	  //printf("w_a = %f \n",-w_a/cnt);
 	}
       }
-      //printf("psi_d = %f\n",atan2(v_d[n+1],u_d[n+1]));
 #endif
 #endif
-V_qIp(0) = V_qI(0);
-V_qIp(1) = V_qI(1);
-//psi_d = atan2(v_d[n+1],u_d[n+1]);
-//printf("psi_d = %f\n",psi_d);
-//psi_d=0;
-#ifdef FREE_FLY
-
+      // remeber previous inertial u,v
+      V_qIp(0) = V_qI(0); 
+      V_qIp(1) = V_qI(1);
+      psi_d = 0; // set zero heading command
+     
+#ifdef FREE_FLY // fly with keyboard i,j,k,l keys
+      
       P_gI(2) = z_e[n+1]-z_g; // relative k position of goal
 
       if (land) { // go straight down
 	P_gI(2)=-1;
       }
 
-      p_gn=abs(P_gI(2)); // distance to goal
+      p_gn=abs(P_gI(2)); // distance to ground
 
       // compute w_d
       if (p_gn >= st_d) {
@@ -1061,7 +1024,8 @@ V_qIp(1) = V_qI(1);
 	w_d[n+1]=-sd*P_gI(2)/st_d;
       }
 
-      u_d[n+1]=u_d[n];
+      // keep previous desired velocities
+      u_d[n+1]=u_d[n]; 
       v_d[n+1]=v_d[n];
 
 #endif
@@ -1079,7 +1043,8 @@ V_qIp(1) = V_qI(1);
 
 	case 'a' : // avoid objects
 	  avoid = true;
-	  x_g = 3.0;
+	  // set destination
+	  x_g = 10.0; 
 	  //y_g = -1.0;
 	  break;
 
@@ -1088,12 +1053,10 @@ V_qIp(1) = V_qI(1);
 	  break;
 
 	case 'f' : // yaw to 90 degrees
-	  //psi_d=psi_d+.1;
 	  psi_d=pi/2;
 	  break;
 
 	case 'd': // yaw to -90 degrees
-	  //psi_d=psi_d-.1;
 	  psi_d=-pi/2;
 	  break;
 
@@ -1128,7 +1091,7 @@ V_qIp(1) = V_qI(1);
 	  u_d[n+1]=-2.0;
 	  break;
 
-	case 'z' : // hover; zero velocity and attitude, stop trajectory
+	case 'z' : // zero the desired velocity and stop trajectory
 	  avoid = false;
 	  traj=false;
 	  u_d[n+1]=0;
@@ -1136,7 +1099,7 @@ V_qIp(1) = V_qI(1);
 	  //psi_d=0;
 	  break;
 
-	case 'x' : // shutdown pwm, write data, exit program
+	case 'x' : // shutdown motors, write data, exit program
 #ifdef PWM
 	  setAllPWM(pwm,low);
 #endif
@@ -1149,6 +1112,13 @@ V_qIp(1) = V_qI(1);
 	  printf("Closest object approach: %f \n",d_min);
 
 	  write_Params(n,Time,kP,bP);
+
+	  // get points relative to quadrotor's final position (for overlay with quadrotor trajectory)
+	  for (int i=0; i<n_pts; i++) {
+	    pts(0,i) = pts(0,i)+x_e[n];
+	    pts(1,i) = pts(1,i)+y_e[n];
+	    pts(2,i) = -pts(2,i)-z_e[n];
+	  }
 
 	  write_Map(i,pts);
 
@@ -1179,7 +1149,7 @@ V_qIp(1) = V_qI(1);
       u3_c=u3_cp+u4_cp*dt;
       u4_c=-a3*u3_c-a2*u2_c-a1*ud_c-a0*(u_c[n+1]-u_d[n+1]);
 
-      // set previous reference commands (used for solving refrence model with euler method)
+      // set previous reference commands (used for solving refrence model with Euler method)
       ud_cp=ud_c; u2_cp=u2_c; u3_cp=u3_c; u4_cp=u4_c;
 
       v_c[n+1]=v_c[n]+vd_cp*dt;
@@ -1194,7 +1164,6 @@ V_qIp(1) = V_qI(1);
       wd_c=wd_cp+w2_cp*dt;
       w2_c=w2_cp+w3_cp*dt;
       w3_c=w3_cp+w4_cp*dt;
-      //w4_c=-aw3*w3_c-aw2*w2_c-aw1*wd_c-aw0*(w_c[n+1]-w_d[n+1]);
       w4_c=-a3*w3_c-a2*w2_c-a1*wd_c-a0*(w_c[n+1]-w_d[n+1]);
 
       wd_cp=wd_c; w2_cp=w2_c; w3_cp=w3_c; w4_cp=w4_c;
@@ -1221,7 +1190,6 @@ V_qIp(1) = V_qI(1);
       alu = ud_c-ku*e_u[n+1]-kiu*Ie_u[n+1];
       alv = vd_c-kv*e_v[n+1]-kiv*Ie_v[n+1];
       alw = wd_c-kw*e_w[n+1]-kiw*Ie_w[n+1]-g;
-      //alw = wd_c-kw*e_w[n+1]-(z_e[n+1]-z_g)-g;
 
       alud = u2_c-ku*(ud[n+1]-ud_c)-kiu*e_u[n+1];
       alvd = v2_c-kv*(vd[n+1]-vd_c)-kiv*e_v[n+1];
@@ -1241,6 +1209,7 @@ V_qIp(1) = V_qI(1);
       theta2_d = 0;
       phi2_d = 0;
 
+      O = matrix::Eulerf(phi[n+1],theta[n+1],psi[n+1]);
 #ifdef VELOCITY_CTRL
 
       Td = m*(-w2_c+kw*(wd[n+1]-wd_c)+kiw*e_w[n+1])/cph/cth
@@ -1248,11 +1217,11 @@ V_qIp(1) = V_qI(1);
 //      Td = m*(-w2_c+kw*(wd[n+1]-wd_c)+w_e[n+1])/cph/cth
   //        +T[n+1]*(phid*tan(phi[n+1])+thetad*tth);
 
-      // Calculate inertial jerks (assholes tbh)
+      // Calculate inertial jerks (assholes to be honest)
       u2 = -Td/m*O(0,2)+T[n+1]/m*(phid*O(0,1)-thetad*cph*cth*cps+psid*O(1,2));
-	/*-lambda*(om2[n]+om4[n]+om1[n]+om3[n])*(ud[n+1]*cps*cth-u_e[n+1]*psid*sps*cth-u_e[n+1]*cps*thetad*sth-wd[n+1]*sth-w_e[n+1]*thetad*cth+vd[n+1]*cth*sps-v_e[n+1]*thetad*sth*sps+v_e[n+1]*cth*psid*cps);*/
+      /*-lambda*(om2[n]+om4[n]+om1[n]+om3[n])*(ud[n+1]*cps*cth-u_e[n+1]*psid*sps*cth-u_e[n+1]*cps*thetad*sth-wd[n+1]*sth-w_e[n+1]*thetad*cth+vd[n+1]*cth*sps-v_e[n+1]*thetad*sth*sps+v_e[n+1]*cth*psid*cps);*/ // propeller drag?
       v2 = -Td/m*O(1,2)+T[n+1]/m*(phid*O(1,1)-thetad*cph*cth*sps-psid*O(0,2));
-	/*-lambda*(om2[n]+om4[n]+om1[n]+om3[n])*(vd[n+1]*(cph*cps+sph*sps*sth)+v_e[n+1]*(-phid*sph*cps-psid*cph*sps+phid*cph*sps*sth+psid*sph*cps*sth+thetad*sph*sps*cth)-ud[n+1]*(cph*sps-cps*sph*sth)-u_e[n+1]*(-phid*sph*sps+psid*cph*cps+psid*sps*sph*sth-phid*cps*cph*sth-thetad*cps*sph*cth)+wd[n+1]*cth*sph-w_e[n+1]*thetad*sth*sph)+w_e[n+1]*phid*cth*cph;*/
+      /*-lambda*(om2[n]+om4[n]+om1[n]+om3[n])*(vd[n+1]*(cph*cps+sph*sps*sth)+v_e[n+1]*(-phid*sph*cps-psid*cph*sps+phid*cph*sps*sth+psid*sph*cps*sth+thetad*sph*sps*cth)-ud[n+1]*(cph*sps-cps*sph*sth)-u_e[n+1]*(-phid*sph*sps+psid*cph*cps+psid*sps*sph*sth-phid*cps*cph*sth-thetad*cps*sph*cth)+wd[n+1]*cth*sph-w_e[n+1]*thetad*sth*sph)+w_e[n+1]*phid*cth*cph;*/ //propeller drag?
       w2 = w2_c-kw*(wd[n+1]-wd_c)-kiw*e_w[n+1];
 
       alu2 = u3_c-ku*(u2-u2_c)-kiu*(ud[n+1]-ud_c);
@@ -1292,12 +1261,12 @@ V_qIp(1) = V_qI(1);
 
 #endif
 
-      // angle errors
+      // Euler angle errors
       e_phi[n+1] = phi[n+1]-phi_d[n+1];
       e_the[n+1] = theta[n+1]-theta_d[n+1];
       e_psi[n+1] = psi[n+1]-psi_c[n+1];
 
-      // integral of angle errors
+      // integral of Euler angle errors
       Ie_ph[n+1] = Ie_ph[n]+(e_phi[n+1]+e_phi[n])*dt/2;
       Ie_th[n+1] = Ie_th[n]+(e_the[n+1]+e_the[n])*dt/2;
       Ie_ps[n+1] = Ie_ps[n]+(e_psi[n+1]+e_psi[n])*dt/2;
@@ -1334,11 +1303,13 @@ V_qIp(1) = V_qI(1);
       Ie_r[n+1] = Ie_r[n]+(e_r[n+1]+e_r[n])*dt/2;
 
       // torques inputs
-      t1[n+1] = (pd_d-kp*e_p[n+1]-kip*Ie_p[n+1]-e_phi[n+1])*Ixx;//+q[n+1]*r[n+1]*(Izz-Iyy)+q[n+1]*Hp[n];
+      t1[n+1] = (pd_d-kp*e_p[n+1]-kip*Ie_p[n+1]-e_phi[n+1])*Ixx+q[n+1]*r[n+1]*(Izz-Iyy)+q[n+1]*Hp[n];
       t2[n+1] = (qd_d-kq*e_q[n+1]-kiq*Ie_q[n+1]-e_phi[n+1]*sph*tth
-		 -e_the[n+1]*cph-e_psi[n+1]*sph/cth)*Iyy;//-p[n+1]*r[n+1]*(Izz-Ixx)-p[n+1]*Hp[n];
+		 -e_the[n+1]*cph-e_psi[n+1]*sph/cth)*Iyy-p[n+1]*r[n+1]*(Izz-Ixx)-p[n+1]*Hp[n];
       t3[n+1] = (rd_d-kr*e_r[n+1]-kir*Ie_r[n+1]-e_phi[n+1]*cph*tth
-		 +e_the[n+1]*sph-e_psi[n+1]*cph/cth)*Izz;//+p[n+1]*q[n+1]*(Iyy-Ixx);
+		 +e_the[n+1]*sph-e_psi[n+1]*cph/cth)*Izz+p[n+1]*q[n+1]*(Iyy-Ixx);
+
+      // try out different torque inputs
       /*
 +q[n+1]*r[n+1]*(Izz-Iyy)+q[n+1]*Hp[n]
 -p[n+1]*r[n+1]*(Izz-Ixx)-p[n+1]*Hp[n]
@@ -1350,19 +1321,17 @@ V_qIp(1) = V_qI(1);
       t1[n+1] = (pd_d-kp*(p[n+1]-p_d[n+1]))*Ixx+q[n+1]*Hp[n];
       t2[n+1] = (qd_d-kq*(q[n+1]-q_d[n+1]))*Iyy-p[n+1]*Hp[n];
       t3[n+1] = (rd_d-kr*(r[n+1]-r_d[n+1]))*Izz;
-      */
+      */ 
 
-      // set sane torque limits (.4 N*m)
+      // limit control torques to 0.4 N*m
       if (abs(t1[n+1])>.4) t1[n+1] = sgn(t1[n+1])*.4;
       if (abs(t2[n+1])>.4) t2[n+1] = sgn(t2[n+1])*.4;
       if (abs(t3[n+1])>.4) t3[n+1] = sgn(t3[n+1])*.4;
 
+      // adaptively update thrust constant
 #ifdef ADPT_K
       if (z_e[n+1]<-.301) {
-
-	// only do this if integral gain kiw=0;
 	k=k-(8.0e-9f)*sigma(e_w[n+1],.03);
-	//if (k<1.12*pow(10,-6)) k=1.12*pow(10,-6);
 	if (k<.8*kP[0]) k=.8*kP[0];
 	if (k>1.2*kP[0]) k=1.2*kP[0];
 
@@ -1400,7 +1369,7 @@ V_qIp(1) = V_qI(1);
       if (isnan(om3[n+1])) om3[n+1]=om3[n];
       if (isnan(om4[n+1])) om4[n+1]=om4[n];
 
-      // Angular momentum of props
+      // Angular momentum of propellers
       Hp[n+1]=(om1[n+1]+om3[n+1]-om2[n+1]-om4[n+1])*Ip;
 
       // compute pwm duty cycle based on effective pwm range and min/max propeller speeds
@@ -1416,9 +1385,9 @@ V_qIp(1) = V_qI(1);
       pwm->ledOffTime(14,min3+duty3);
       pwm->ledOffTime(0,min4+duty4);
 #endif
-      n = n+1; // data array increment
+      n = n+1; // increment data arrays
 
-      if (n==size-1) { // reset arrays (previous 6000 data points in all arrays are lost)
+      if (n==size-1) { // reset arrays (previous 6000 data points in all arrays will be lost!)
 	x_e[0] = x_e[n]; y_e[0] = y_e[n]; z_e[0] = z_e[n];
 	u_e[0] = u_e[n]; v_e[0] = v_e[n]; w_e[0] = w_e[n];
 	ud[0] = ud[n]; vd[0] = vd[n]; wd[0] = wd[n];

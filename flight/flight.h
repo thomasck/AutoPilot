@@ -60,7 +60,7 @@ int16_t a_x,a_y,a_z; // used for correcting accel for rotation (due to IMU offse
 
 volatile bool mpuInterrupt = false;  // indicates whether MPU interrupt pin has gone high
 
-const int n_pts = 1000; // number of points to map
+const int n_pts = 1400; // number of points to map
 
 Quaternion fromEuler(float ypr[]) {
   float cosX2 = cos(ypr[2] / 2.0f);
@@ -111,6 +111,7 @@ char getUserChar() {
   if (i <= 0) return 0;
   return tolower(getchar());
 }
+
 
 float ElpsdRad(const Vector3f &P_o,float a,float b,float c) {
   float theta,phi,x,y,z;
@@ -447,6 +448,3 @@ char kcom; // key command
 bool traj=false;
 bool land=false;
 bool avoid=false;
-
-// Initialize rest values
-float gx_r=0; float gy_r=0; float gz_r=0;
